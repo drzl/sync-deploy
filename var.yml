@@ -1,0 +1,3 @@
+sync_php_ver: 7.4
+sync_db_ver: 7.0.50.383
+sync_f_clone_host: sync-f-db-clone.pvision

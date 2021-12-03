@@ -1,0 +1,12 @@
+sync:
+  hosts:
+    d11a.pvision:
+      sync_admin_user: vedmed
+      sync_int_dom: d11a.pvision
+      sync_pub_dom: d11a.gen3.pvision.ru
+      sync_net_ip_base: 161
+    d11b.pvision:
+      sync_admin_user: vedmed
+      sync_int_dom: d11b.pvision
+      sync_pub_dom: d11b.gen3.pvision.ru
+      sync_net_ip_base: 162

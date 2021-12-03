@@ -1,0 +1,8 @@
+{
+    "log_level": "notice",
+    "auth_url_": "unrestricted",
+    "auth_url": "http://sync-f-api.{{ sync_int_dom }}/api/user",
+    "msg_url": "{{ sync_pub_prefix }}/msg?session_id=",
+    "command": "/usr/bin/php",
+    "command_args": ["/var/www/sync/msgs-sync.php"]
+}

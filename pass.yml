@@ -1,0 +1,7 @@
+sync_admin_pass: "q1w2e3"
+sync_root_pass: "q1w2e3"
+sync_fb_password: "q1w2e3"
+sync_fb_reporter_password: "a"
+sync_mysql_pass_bp: "q1w2e3"
+sync_mysql_pass_replica: "q1w2e3"
+sync_hg_pass: "q1w2e3"

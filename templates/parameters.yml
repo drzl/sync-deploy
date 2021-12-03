@@ -1,0 +1,27 @@
+parameters:
+    database_host: 127.0.0.1
+    database_port: null
+    database_name: bpsync
+    database_user: bp
+    database_password: '{{ sync_mysql_pass_bp }}'
+
+    mailer_transport: sendmail
+    mailer_host: 127.0.0.1
+    mailer_user: null
+    mailer_password: null
+
+    secret: cdd97f8ab1de92212e8f20fd940e1af7616989ce
+    limit: 100
+    archive_limit: 10
+    search_limit: 30
+    base_url: bpws.pvision
+    activation_code_length: 5
+    email: 'bp@pvision.ru'
+    email_name: 'Бизнес Пак Онлайн'
+    telepak_url: 'http://sync-reporter.{{ sync_int_dom }}:8087/open'
+    sync_api_url: 'http://sync-api.{{ sync_int_dom }}/api'
+    bp_web_url: https://5.375.ru
+    bp_android_url: https://play.google.com/store/apps/details?id=ru.pvision.bussinespack
+    bpsetup_url: https://www.pvision.ru/download/bp/700/sync/latest/bpsetup-sync.exe
+    payment_form_url: https://pvision.ru/bp-promo-500
+    demo_telepak_disable_doc_count: 30

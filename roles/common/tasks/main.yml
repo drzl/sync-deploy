@@ -1,0 +1,44 @@
+---
+#- hosts: all
+
+#  tasks:
+
+    - name: Setup apt
+      copy:
+        dest: /etc/apt/sources.list
+        content: |
+          deb http://deb.debian.org/debian/ bullseye main contrib non-free
+          deb http://security.debian.org/debian-security bullseye-security main contrib non-free
+          deb http://deb.debian.org/debian/ bullseye-updates main contrib non-free
+          deb http://deb.debian.org/debian/ bullseye-backports main contrib non-free
+
+    - name: Update and upgrade apt packages
+      apt:
+        upgrade: false
+        update_cache: true
+
+    - name: Install initial packages
+      apt:
+        name: [locales, sudo, mc, bash-completion]
+        state: present
+        install_recommends: false
+
+    - name: Configure locales A
+      locale_gen:
+        name: en_US.UTF-8
+        state: present
+
+    - name: Configure locales B
+      locale_gen:
+        name: ru_RU.UTF-8
+        state: present
+
+    - name: Config mc
+      copy:
+        dest: "/etc/mc/mc.ini"
+        content: |
+          [Midnight-Commander]
+          use_internal_edit=true
+
+          [Layout]
+          message_visible=0

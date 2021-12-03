@@ -1,0 +1,10 @@
+[Unit]
+Description=LXC events monitor watch
+
+[Service]
+Type=simple
+WorkingDirectory=/tmp
+ExecStart=/usr/local/bin/lxc-monitor-watch.sh
+
+[Install]
+WantedBy=multi-user.target

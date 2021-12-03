@@ -1,0 +1,892 @@
+#TODO: timezones, resolvconf
+
+- hosts: sync
+
+  vars:
+    ansible_ssh_user: "{{ sync_admin_user }}"
+    ansible_ssh_pass: "{{ sync_admin_pass }}"
+    ansible_become_password: "{{ sync_root_pass }}"
+
+  tasks:
+    - name: Set ssh key
+      become: true
+      become_method: su
+      authorized_key:
+        user: root
+        state: present
+        key: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+
+- hosts: sync
+
+  vars:
+    ansible_ssh_user: root
+    sync_pub_dom_sync: "sync.{{ sync_pub_dom }}"
+    sync_pub_dom_sync_f: "sync-f.{{ sync_pub_dom }}"
+
+  roles:
+    - common
+
+  tasks:
+
+    - name: Allow admin user exec sudo
+      user:
+        name: "{{ sync_admin_user }}"
+        groups: adm,sudo
+        append: true
+
+    - name: Install system packages
+      apt:
+        name: [psmisc, net-tools, socat, iptables, apparmor, openssl]
+        state: present
+        install_recommends: false
+
+    - name: Config DHCP client
+      blockinfile:
+        dest: "/etc/dhcp/dhclient.conf"
+        content: |
+          supersede domain-name "{{ sync_int_dom }}";
+          supersede domain-search "{{ sync_int_dom }}";
+          supersede domain-name-servers 127.0.0.1;
+
+    - name: Install DNS packages
+      apt:
+        name: [dnsmasq]
+        state: present
+        install_recommends: false
+
+    - name: Creates LXC hosts directory
+      file:
+        path: /var/tmp/lxc-hosts
+        state: directory
+
+    - name: Config DNS server
+      template:
+        src: "./templates/dnsmasq.conf"
+        dest: "/etc/dnsmasq.conf"
+        owner: root
+        mode: "0644"
+      register: dnsmasq_conf
+
+    - name: Restart DNS server A
+      service:
+        name: dnsmasq
+        state: restarted
+      when: dnsmasq_conf.changed
+
+    - name: Config resolv.conf
+      copy:
+        dest: "/etc/resolv.conf"
+        owner: root
+        mode: "0644"
+        content: |
+          domain {{ sync_int_dom }}
+          search {{ sync_int_dom }}.
+          nameserver 127.0.0.1
+
+    - name: Config routing A
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        sysctl_set: yes
+        state: present
+        reload: yes
+
+    - name: Create LXC export dir
+      file:
+        path: /mnt/export
+        state: directory
+
+    - name: Create LXC export mount point
+      mount:
+        path: /mnt/export
+        src: tmpfs
+        fstype: tmpfs
+        opts: "nofail,rw,size=16M,noexec,nodev,nosuid,gid=www-data,mode=775"
+        state: mounted
+
+    - name: Config LXC A
+      copy:
+        dest: "/etc/default/lxc-net"
+        content: |
+          USE_LXC_BRIDGE="false"
+          #USE_LXC_BRIDGE="true"
+
+          # Honor system's dnsmasq configuration
+          #LXC_DHCP_CONFILE=/etc/dnsmasq.conf
+
+    - name: Install container packages
+      apt:
+        name: [lxc, python3-lxc, bridge-utils, debootstrap, dirmngr, gnupg, lxcfs, lxc-templates, rsync, uidmap]
+        state: present
+        install_recommends: false
+
+    - name: Config LXC AppArmor
+      lineinfile:
+        path: /etc/apparmor.d/abstractions/lxc/start-container
+        insertbefore: BOF
+        line: "  mount options=bind /var/lib/lxc/*/rootfs/ -> /mnt/export/*/root/ ,"
+      register: lxc_aa_conf
+
+    - name: Reload AppArmor
+      command: apparmor_parser -r /etc/apparmor.d
+      when: lxc_aa_conf.changed
+
+    - name: Config LXC B
+      copy:
+        dest: "/etc/lxc/default.conf"
+        content: |
+          lxc.net.0.type = veth
+          lxc.net.0.link = virbr0
+          lxc.net.0.flags = up
+          #lxc.net.0.ipv4.gateway = 192.168.{{ sync_net_ip_base }}.1
+
+          lxc.apparmor.profile = generated
+          lxc.apparmor.allow_nesting = 1
+
+    - name: Install LXC hooks script
+      template:
+        src: "./templates/lxc-hooks.sh"
+        dest: "/usr/local/bin/lxc-hooks.sh"
+        owner: root
+        mode: "0755"
+
+    - name: Install LXC monitor watch script
+      template:
+        src: "./templates/lxc-monitor-watch.sh"
+        dest: "/usr/local/bin/lxc-monitor-watch.sh"
+        owner: root
+        mode: "0755"
+      register: lxc_monitor_watch_script
+
+    - name: Install LXC monitor watch service
+      template:
+        src: "./templates/lxc-monitor-watch.service"
+        dest: "/etc/systemd/system/lxc-monitor-watch.service"
+        owner: root
+        mode: "0644"
+
+    - name: Start LXC monitor watch service
+      systemd:
+        name: lxc-monitor-watch
+        enabled: true
+        state: started
+
+    - name: Retart LXC monitor watch service
+      service:
+        name: lxc-monitor-watch
+        state: restarted
+      when: lxc_monitor_watch_script.changed
+
+    - name: Setup container bridge interface
+      copy:
+        dest: "/etc/network/interfaces.d/virbr0"
+        owner: root
+        mode: "0644"
+        content: |
+          auto virbr0
+          iface virbr0 inet static
+                  bridge_ports none
+                  address 192.168.{{ sync_net_ip_base }}.1
+                  broadcast 192.168.{{ sync_net_ip_base }}.255
+                  netmask 255.255.255.0
+
+    - name: Bridge up
+      shell: |
+        if [ -d /sys/class/net/virbr0 ]; then
+            exit 99
+        else
+            ifup virbr0 || exit $?
+            systemctl restart dnsmasq || exit $?
+        fi
+      register: virbr0_up
+      failed_when: virbr0_up.rc != 0 and virbr0_up.rc != 99
+      changed_when: virbr0_up.rc != 99
+
+    - name: Restart DNS server B
+      service:
+        name: dnsmasq
+        state: restarted
+      when: virbr0_up.changed
+
+    - name: Config firewall
+      template:
+        src: "./templates/nftables.conf"
+        dest: "/etc/nftables.conf"
+        owner: root
+        mode: "0644"
+      register: firewall_conf
+
+    - name: Start firewall
+      systemd:
+        name: nftables
+        enabled: true
+        state: started
+      register: firewall_start
+
+    - name: Reload firewall
+      systemd:
+        name: nftables
+        state: reloaded
+      when: firewall_conf.changed and (not firewall_start.changed)
+
+    - name: Create LXC template debian-pv
+      shell: |
+        if ! sed 's/iface eth0 inet dhcp/iface eth0 inet manual/' /usr/share/lxc/templates/lxc-debian > /tmp/lxc-debian-pv; then
+            rm -f /tmp/lxc-debian-pv
+            exit 1
+        fi
+        if cmp -s /tmp/lxc-debian-pv /usr/share/lxc/templates/lxc-debian-pv; then
+            rm -f /tmp/lxc-debian-pv
+            exit 99
+        fi
+        if ! cp /tmp/lxc-debian-pv /usr/share/lxc/templates/lxc-debian-pv; then
+            rm -f /tmp/lxc-debian-pv
+            exit 1
+        fi
+        rm -f /tmp/lxc-debian-pv
+        chmod 0755 /usr/share/lxc/templates/lxc-debian-pv || exit $?
+      register: lxc_template_pv
+      failed_when: lxc_template_pv.rc != 0 and lxc_template_pv.rc != 99
+      changed_when: lxc_template_pv.rc != 99
+
+    - name: Transition container ssh key
+      copy:
+        dest: "/opt/trans.pub"
+        content: "{{ lookup('file', '~/.ssh/id_ed25519.pub') }}"
+
+    - name: Create container sync
+      environment:
+        http_proxy: http://deb-proxy.c6.pvision:8000
+      lxc_container:
+        name: "{{ item.name }}"
+        container_log: true
+        template: debian-pv
+        state: started
+        template_options: --release=bullseye --packages=sudo,python3-minimal,python3-apt,libpython3-stdlib --auth-key=/opt/trans.pub
+        container_config:
+          - "lxc.net.0.ipv4.gateway = 192.168.{{ sync_net_ip_base }}.1"
+          - "lxc.net.0.ipv4.address = 192.168.{{ sync_net_ip_base }}.{{ item.ip }}/24"
+          - "lxc.hook.pre-start = /usr/local/bin/lxc-hooks.sh"
+          - "lxc.hook.mount = /usr/local/bin/lxc-hooks.sh"
+          - "lxc.hook.start-host = /usr/local/bin/lxc-hooks.sh"
+          - "lxc.hook.post-stop = /usr/local/bin/lxc-hooks.sh"
+      loop:
+        - name: sync
+          ip: 10
+        - name: sync-f
+          ip: 11
+
+    - name: Add sync to container inventory
+      add_host:
+        name: "sync.{{ hostvars[item].sync_int_dom }}"
+        group: container_sync
+
+        sync_int_dom: "{{ hostvars[item].sync_int_dom }}"
+        sync_net_ip_base: "{{ hostvars[item].sync_net_ip_base }}"
+
+        sync_api_dom_f: "sync-f-api.{{ hostvars[item].sync_int_dom }}"
+
+        sync_pub_dom_sync: "sync.{{ hostvars[item].sync_pub_dom }}"
+        sync_pub_dom_sync_f: "sync-f.{{ hostvars[item].sync_pub_dom }}"
+
+        sync_pub_prefix: "https://sync.{{ hostvars[item].sync_pub_dom }}"
+        sync_pub_prefix_f: "https://sync-f.{{ hostvars[item].sync_pub_dom }}"
+
+        ansible_ssh_extra_args: "-J root@{{ hostvars[item].sync_int_dom }} -o 'RemoteForward 80 vc.pvision:80'"
+        ansible_scp_extra_args: "-J root@{{ hostvars[item].sync_int_dom }}"
+        ansible_sftp_extra_args: "-J root@{{ hostvars[item].sync_int_dom }}"
+
+      loop: "{{ groups['sync'] }}"
+      changed_when: false #!?
+
+    - name: Add sync-f to container inventory
+      add_host:
+        name: "sync-f.{{ hostvars[item].sync_int_dom }}"
+        group: container_sync_f
+
+        sync_int_dom: "{{ hostvars[item].sync_int_dom }}"
+        sync_net_ip_base: "{{ hostvars[item].sync_net_ip_base }}"
+
+        sync_api_dom_f: "sync-f-api.{{ hostvars[item].sync_int_dom }}"
+
+        sync_pub_dom_sync: "sync.{{ hostvars[item].sync_pub_dom }}"
+        sync_pub_dom_sync_f: "sync-f.{{ hostvars[item].sync_pub_dom }}"
+
+        sync_pub_prefix: "https://sync.{{ hostvars[item].sync_pub_dom }}"
+        sync_pub_prefix_f: "https://sync-f.{{ hostvars[item].sync_pub_dom }}"
+
+        ansible_ssh_extra_args: "-J root@{{ hostvars[item].sync_int_dom }} -o 'RemoteForward 50022 gitorious.pvision:22' -o 'RemoteForward 12345 {{ sync_f_clone_host }}:12345'"
+        ansible_scp_extra_args: "-J root@{{ hostvars[item].sync_int_dom }}"
+        ansible_sftp_extra_args: "-J root@{{ hostvars[item].sync_int_dom }}"
+
+      loop: "{{ groups['sync'] }}"
+      changed_when: false #!?
+
+    - name: Add virbr address to hosts
+      lineinfile:
+        dest: /etc/hosts
+        regexp: '.*virbr.alias$'
+        line: "192.168.{{ sync_net_ip_base }}.1 virbr.alias"
+        state: present
+
+    - name: Add www-admin user
+      user:
+        name: www-admin
+        group: www-data
+        shell: /bin/bash
+
+    - name: Install python cryptography
+      apt:
+        name: [python3-cryptography]
+        state: present
+        install_recommends: false
+
+    - name: Lets encrypt work dir
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: www-admin
+        group: www-data
+        mode: 0750
+      loop: ["/var/lib/acme", "/var/lib/acme/domains"]
+
+    - name: Generate Lets encrypt Diffie-Hellman parameters
+      openssl_dhparam:
+        path: /var/lib/acme/dhparam.pem
+        owner: www-admin
+        group: www-data
+        mode: 0640
+
+    - name: Generate Lets encrypt account key
+      openssl_privatekey:
+        path: /var/lib/acme/account.key
+        size: 4096
+        owner: www-admin
+        group: www-data
+        mode: 0640
+
+    - name: Lets encrypt challenges dir
+      file:
+        path: /var/www/challenges
+        state: directory
+        owner: www-admin
+        group: www-data
+        mode: 0770
+
+    - name: Install Lets encrypt update script
+      copy:
+        src: "./templates/lets-encrypt-update.sh"
+        dest: "/usr/local/bin/lets-encrypt-update.sh"
+        owner: root
+        mode: "0755"
+
+    - name: Add public host name to Lets encrypt list
+      lineinfile:
+        dest: /usr/local/etc/lets-encrypt-hosts
+        line: "{{ item }}.{{ sync_pub_dom }}"
+        create: true
+        state: present
+      loop: ["sync", "sync-f"]
+
+    - name: Install http server
+      apt:
+        name: [nginx, libnginx-mod-http-echo, acme-tiny]
+        state: present
+        install_recommends: false
+
+    - name: Remove default site
+      file:
+        dest: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Dummy ssl dir
+      file:
+        path: /etc/nginx/ssl/0term
+        state: directory
+
+    - name: Dummy ssl cert
+      copy:
+        src: "./templates/0term.crt"
+        dest: /etc/nginx/ssl/0term/0term.crt
+
+    - name: Dummy ssl key
+      copy:
+        src: "./templates/0term.key"
+        dest: /etc/nginx/ssl/0term/0term.key
+
+    - name: Dummy ssl config
+      template:
+        src: "./templates/0term"
+        dest: /etc/nginx/sites-available/0term
+
+    - name: Dummy ssl config link
+      file:
+        src: /etc/nginx/sites-available/0term
+        dest: /etc/nginx/sites-enabled/0term
+        state: link
+
+    - name: Lets encrypt ssl dir
+      file:
+        path: /etc/nginx/ssl/letsencrypt
+        state: directory
+
+    - name: sync config
+      template:
+        src: "./templates/sync"
+        dest: /etc/nginx/sites-available/sync
+
+    - name: sync config link
+      file:
+        src: /etc/nginx/sites-available/sync
+        dest: /etc/nginx/sites-enabled/sync
+        state: link
+
+    - name: Config Nginx log format
+      copy:
+        dest: "/etc/nginx/conf.d/log-format.conf"
+        owner: root
+        mode: "0644"
+        content: |
+          log_format timed_combined '$remote_addr - $remote_user [$time_local] '
+              '"$request" $status $body_bytes_sent '
+              '"$http_referer" "$http_user_agent" '
+              '$request_time $upstream_response_time';
+
+    - name: sync-f config
+      template:
+        src: "./templates/sync-f"
+        dest: /etc/nginx/sites-available/sync-f
+
+    - name: sync-f config link
+      file:
+        src: /etc/nginx/sites-available/sync-f
+        dest: /etc/nginx/sites-enabled/sync-f
+        state: link
+
+- hosts: container_sync
+
+  vars:
+    ansible_ssh_user: root
+
+  pre_tasks:
+
+    - name: Config resolv.conf
+      copy:
+        dest: "/etc/resolv.conf"
+        owner: root
+        mode: "0644"
+        content: |
+          domain {{ sync_int_dom }}
+          search {{ sync_int_dom }}.
+          nameserver 192.168.{{ sync_net_ip_base }}.1
+
+    - name: Admin user
+      user:
+        name: admin
+        shell: /bin/bash
+        groups: adm,sudo,cdrom,floppy,audio,dip,video,plugdev,netdev
+        append: true
+
+  roles:
+    - common
+
+  tasks:
+
+    - name: Install auxiliary programs
+      apt:
+        name: [less, iputils-ping, net-tools, dnsutils, netcat, wget, curl, nullmailer, cron, logrotate]
+        state: present
+        install_recommends: false
+
+    - name: Install DVCS
+      apt:
+        name: [mercurial]
+        state: present
+        install_recommends: false
+
+    - name: Install PHP packages
+      apt:
+        name: php-bcmath, php-common, php-curl, php-fpm, php-interbase, php-mbstring, php-zip, php-yac
+        state: present
+        install_recommends: false
+
+    - name: Install Firebird SQL
+      apt:
+        name: [firebird3.0-server]
+        state: present
+        install_recommends: false
+
+    - name: Config Firebird SQL admin user A
+      lineinfile:
+        path: /etc/firebird/3.0/SYSDBA.password
+        regexp: '^\s*ISC_PASSWORD'
+        line: 'ISC_PASSWORD="{{ sync_fb_password }}"'
+
+    - name: Config Firebird SQL admin user B
+      shell: |
+        gsec -user SYSDBA -password '{{ sync_fb_password }}' -display SYSDBA
+        gsec_rc="$?"
+        if [ "$gsec_rc" -eq 0 ]; then
+            exit 99
+        fi
+        if [ "$gsec_rc" -ne 15 ]; then
+            exit "$gsec_rc"
+        fi
+        service firebird3.0 stop || exit "$?"
+        echo "create or alter user sysdba password '{{ sync_fb_password }}';" | isql-fb -user sysdba /var/lib/firebird/3.0/system/security3.fdb || exit "$?"
+        service firebird3.0 start || exit "$?"
+      register: fb_admin_config_b
+      failed_when: fb_admin_config_b.rc != 0 and fb_admin_config_b.rc != 99
+      changed_when: fb_admin_config_b.rc != 99
+
+    - name: Config Firebird SQL reporter user
+      shell: |
+        disp=$(gsec -user SYSDBA -password '{{ sync_fb_password }}' -display REPORTER)
+        gsec_rc="$?"
+        if [ "$gsec_rc" -ne 0 ]; then
+            exit "$gsec_rc"
+        fi
+        if [ -n "$disp" ]; then
+            gsec -user REPORTER -password '{{ sync_fb_reporter_password }}' -display REPORTER
+            gsec_rc="$?"
+            if [ "$gsec_rc" -eq 0 ]; then
+                exit 99
+            fi
+            if [ "$gsec_rc" -ne 15 ]; then
+                exit "$gsec_rc"
+            fi
+            gsec -user SYSDBA -password '{{ sync_fb_password }}' -mo REPORTER -pw '{{ sync_fb_reporter_password }}'
+            exit "$?"
+        fi
+        gsec -user SYSDBA -password '{{ sync_fb_password }}' -add REPORTER -pw '{{ sync_fb_reporter_password }}' || exit "$?"
+      register: fb_reporter_config
+      failed_when: fb_reporter_config.rc != 0 and fb_reporter_config.rc != 99
+      changed_when: fb_reporter_config.rc != 99
+
+    - name: Add group pws-sync
+      group:
+        name: pws-sync
+        gid: 801
+        system: true
+        state: present
+
+    - name: Add admin to pws-sync
+      user:
+        name: admin
+        groups: pws-sync
+        append: true
+
+    - name: Add www-data to pws-sync
+      user:
+        name: www-data
+        groups: pws-sync
+        append: true
+      register: www_config_system_user
+
+    - name: Add firebird to pws-sync
+      user:
+        name: firebird
+        groups: pws-sync
+        append: true
+      register: fb_config_system_user
+
+    - name: Add www-admin to pws-sync
+      user:
+        name: www-admin
+        group: www-data
+        groups: pws-sync
+        shell: /bin/bash
+        append: true
+
+    - name: Restart PHP FPM
+      service:
+        name: "php{{ sync_php_ver }}-fpm"
+        state: restarted
+      when: www_config_system_user.changed
+
+    - name: Restart Firebird SQL
+      service:
+        name: firebird3.0
+        state: restarted
+      when: fb_config_system_user.changed
+
+    - name: Creates sync app directory
+      file:
+        path: /var/www/sync
+        state: directory
+        owner: www-admin
+        group: www-data
+        mode: 0755
+
+    - name: Creates sync directories
+      file:
+        path: "{{ item.name }}"
+        state: directory
+        owner: "{{ item.owner }}"
+        group: pws-sync
+        mode: u=rwx,g=rwxs,o=rx
+      loop:
+        - name: "/opt/sync"
+          owner: www-admin
+        - name: "/opt/sync/backup"
+          owner: firebird
+        - name: "/opt/sync/bin"
+          owner: www-admin
+        - name: "/opt/sync/db"
+          owner: firebird
+        - name: "/opt/sync/db/template"
+          owner: firebird
+        - name: "/opt/sync/etc"
+          owner: www-admin
+        - name: "/opt/sync/log"
+          owner: www-admin
+        - name: "/var/tmp/pws_sync"
+          owner: www-admin
+
+    - name: Configure message session daemon
+      template:
+        src: "./templates/msg-sessiond-config.json"
+        dest: "/opt/sync/etc/msg-sessiond-config.json"
+        owner: root
+        mode: "0644"
+      register: msd_conf
+
+    - name: Copy message session daemon binary
+      copy:
+        src: "./bin/msg-sessiond"
+        dest: "/opt/sync/bin/msg-sessiond"
+        owner: root
+        mode: "0755"
+
+    - name: Install message session daemon service
+      template:
+        src: "./templates/msg-sessiond.service"
+        dest: "/etc/systemd/system/msg-sessiond.service"
+        owner: root
+        mode: "0644"
+
+    - name: Start message session daemon service
+      systemd:
+        name: msg-sessiond
+        enabled: true
+        state: started
+      register: msd_start
+
+    - name: Restart message session daemon service
+      systemd:
+        name:  msg-sessiond
+        state: restarted
+      when: msd_conf.changed and (not msd_start.changed)
+
+    - name: Copy database template
+      copy:
+        src: "./bin/sync-db-template-{{ sync_db_ver }}.bk3"
+        dest: "/opt/sync/db/template/sync-db-template-{{ sync_db_ver }}.bk3"
+        owner: firebird
+        mode: "0644"
+
+    - name: Symlink to default database template
+      file:
+        src: "sync-db-template-{{ sync_db_ver }}.bk3"
+        dest: "/opt/sync/db/template/std-latest.bk3"
+        owner: firebird
+        state: link
+
+    - name: Clone sync app
+      become: yes
+      become_user: www-admin
+      hg:
+        repo: "http://vedmed:{{ sync_hg_pass }}@vc.pvision.lo-forward/pws"
+        dest: /var/www/sync
+
+    - name: Config sync app
+      template:
+        src: "./templates/config_pws_sync.php"
+        dest: "/var/www/sync/config_pws_sync.php"
+        owner: www-admin
+        mode: 644
+
+- hosts: container_sync_f
+
+  vars:
+    ansible_ssh_user: root
+    sync_f_app_dir: "/var/www/bpsync_447"
+
+  pre_tasks:
+
+    - name: Config resolv.conf
+      copy:
+        dest: "/etc/resolv.conf"
+        owner: root
+        mode: "0644"
+        content: |
+          domain {{ sync_int_dom }}
+          search {{ sync_int_dom }}.
+          nameserver 192.168.{{ sync_net_ip_base }}.1
+
+    - name: Admin user
+      user:
+        name: admin
+        shell: /bin/bash
+        groups: adm,sudo,cdrom,floppy,audio,dip,video,plugdev,netdev
+        append: true
+
+  roles:
+    - common
+
+  tasks:
+
+    - name: Add www-admin user
+      user:
+        name: www-admin
+        group: www-data
+        shell: /bin/bash
+
+    - name: Make www-admin ssh dir
+      file:
+        path: "/home/www-admin/.ssh"
+        owner: www-admin
+        mode: 0700
+        state: directory
+
+    - name: Copy www-admin ssh-keys
+      copy:
+        dest: "/home/www-admin/.ssh/{{ item }}"
+        src: "./sec/{{ item }}"
+        owner: www-admin
+        mode: 0600
+      loop: ["id_rsa", "id_rsa.pub"]
+
+    - name: Install auxiliary programs
+      apt:
+        name: [less, iputils-ping, net-tools, dnsutils, netcat, wget, curl, nullmailer, cron, logrotate]
+        state: present
+        install_recommends: false
+
+    - name: Install MariaDB SQL server
+      apt:
+        name: [mariadb-server, python3-pymysql]
+        state: present
+        install_recommends: false
+
+    - name: Install PHP packages
+      apt:
+        name: [php, php-fpm, php-xml, php-mysql, php-curl, php-interbase, php-gmp, php-gd]
+        state: present
+        install_recommends: false
+
+    - name: Install DVCS
+      apt:
+        name: [git]
+        state: present
+        install_recommends: false
+
+    - name: Make sync-f app dir
+      file:
+        path: "{{ sync_f_app_dir }}"
+        owner: www-admin
+        group: www-data
+        mode: 0755
+        state: directory
+
+    - name: Clone sync-f app
+      become: yes
+      become_user: www-admin
+      git:
+        repo: "ssh://git@gitorious.pvision.lo-forward:50022/bp/bpws.git"
+        version: prod2
+        dest: "{{ sync_f_app_dir }}"
+        accept_hostkey: true
+
+    - name: Config sync-f app
+      template:
+        src: "./templates/parameters.yml"
+        dest: "/var/www/bpsync_447/config/packages/parameters.yaml"
+        owner: www-admin
+        group: www-data
+        mode: "0644"
+
+    - name: Create bpsync database
+      mysql_db:
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: bpsync
+        state: present
+
+    - name: Create bpsync admin user
+      mysql_user:
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        name: bp
+        password: "{{ sync_mysql_pass_bp }}"
+        priv: 'bpsync.*:ALL'
+        state: present
+
+#    - name: Create bpsync replica user
+#      mysql_user:
+#        login_unix_socket: /var/run/mysqld/mysqld.sock
+#        name: "'replication_user'@'%'"
+#        password: "{{ sync_mysql_pass_replica }}"
+#        priv: '*.*:REPLICATION SLAVE'
+#        state: present
+
+    - name: Check bpsync database content
+      mysql_query:
+        login_unix_socket: /var/run/mysqld/mysqld.sock
+        login_db: bpsync
+        query: "show tables like 'user'"
+      register: bpsync_content
+
+#    - name: Test
+#      debug:
+#        var: bpsync_content.rowcount
+
+    - name: Dump bpsync database
+      args:
+        executable: /bin/bash
+      shell: |
+        prev=$(lsof -ti:12345)
+        let retry=10
+        while [[ -n "$prev" && "$retry" -gt 0 ]]; do
+            let retry--
+            kill $prev
+            sleep 0.1
+            prev=$(lsof -ti:12345)
+        done
+        if [[ -n "$prev" ]]; then
+            exit 1
+        fi
+        fin=$(</proc/sys/kernel/random/uuid)
+        (echo "$fin"; mysqldump --opt -uroot bpsync; echo; echo "$fin") | nc -w 15 -lp 12345 &
+      delegate_to: "root@{{ sync_f_clone_host }}"
+      when: bpsync_content.rowcount[0] < 1
+
+    - name: Restore bpsync database
+      shell: |
+        nc 127.0.0.1 12345 | (read fin; awk '/^'"$fin"'$/ {exit} {print $0}') | mysql -u bp -p"{{ sync_mysql_pass_bp }}" bpsync
+      when: bpsync_content.rowcount[0] < 1
+
+    - name: Cleanup bpsync dump
+      args:
+        executable: /bin/bash
+      shell: |
+        prev=$(lsof -ti:12345)
+        let retry=10
+        while [[ -n "$prev" && "$retry" -gt 0 ]]; do
+            let retry--
+            kill $prev
+            sleep 0.1
+            prev=$(lsof -ti:12345)
+        done
+      delegate_to: "root@{{ sync_f_clone_host }}"
+      when: bpsync_content.rowcount[0] < 1
+
+    - name: Create /opt/bin dir
+      file:
+        path: /opt/bin
+        state: directory
+
+    - name: Create script for reset replica slave
+      template:
+        src: "./templates/sync-to-slave.sh"
+        dest: "/opt/bin/sync-to-slave.sh"
+        owner: root
+        mode: "0755"
