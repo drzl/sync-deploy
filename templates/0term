@@ -1,13 +1,21 @@
 server {
-        listen 80 default_server;
-        server_name "";
-        return 444;
+    listen 80 default_server;
+    listen virbr.alias:80 default_server;
+    server_name "";
+    return 444;
+
+    access_log /var/log/nginx/0term-access.log;
+    error_log /var/log/nginx/0term-error.log;
 }
 
 server {
-        listen 443 ssl default_server;
-        server_name "";
-        ssl_certificate /etc/nginx/ssl/0term/0term.crt;
-        ssl_certificate_key /etc/nginx/ssl/0term/0term.key;
-        return 444;
+    listen 443 ssl default_server;
+    listen virbr.alias:443 default_server;
+    server_name "";
+    ssl_certificate /etc/nginx/ssl/0term/0term.crt;
+    ssl_certificate_key /etc/nginx/ssl/0term/0term.key;
+    return 444;
+
+    access_log /var/log/nginx/0term-access.log;
+    error_log /var/log/nginx/0term-error.log;
 }

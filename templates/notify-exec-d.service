@@ -1,0 +1,16 @@
+[Unit]
+Description=Notification events watch daemon
+Wants=network.target
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=pws-sync
+LimitNOFILE=200000
+ExecStart=/opt/bin/notify-exec-d /opt/etc/notify-exec.toml
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

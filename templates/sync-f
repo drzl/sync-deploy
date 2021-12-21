@@ -31,6 +31,48 @@ map $http_cookie $test_dir {
 
 server {
     listen virbr.alias:80;
+
+    server_name sync-f-api.virbr.{{ sync_int_dom }};
+
+    client_max_body_size 8m;
+
+    location / {
+        return 404;
+    }
+
+    location /api {
+        allow 192.168.0.0/16;
+        allow 10.192.168.0/24;
+        deny all;
+
+        try_files $uri /index.php$is_args$args;
+    }
+
+    location ~ ^/index\.php(/|$) {
+            fastcgi_pass unix:/mnt/export/sync-f/run/php/php7.3-fpm.sock;
+            fastcgi_split_path_info ^(.+\.php)(/.*)$;
+            include fastcgi_params;
+
+            fastcgi_param SCRIPT_FILENAME /var/www/$test_dir/public$fastcgi_script_name;
+            fastcgi_param DOCUMENT_ROOT /var/www/$test_dir/public;
+            # Prevents URIs that include the front controller. This will 404:
+            # http://domain.tld/index.php/some-path
+            # Remove the internal directive to allow URIs like this
+            internal;
+    }
+
+    # return 404 for all other php files not matching the front controller
+    # this prevents access to other php files you don't want to be accessible.
+    location ~ \.php$ {
+        return 404;
+    }
+
+    error_log /var/log/nginx/sync-f-api-error.log;
+    access_log /var/log/nginx/sync-f-api-access.log timed_combined;
+}
+
+server {
+    listen virbr.alias:80;
     listen 443 ssl;
 
     server_name 5.375.ru sync-f.virbr.{{ sync_int_dom }} {{ sync_pub_dom_sync_f }};
@@ -139,5 +181,5 @@ server {
     }
 
     error_log /var/log/nginx/sync-f-error.log;
-    access_log /var/log/nginx/sync-f_access.log timed_combined;
+    access_log /var/log/nginx/sync-f-access.log timed_combined;
 }

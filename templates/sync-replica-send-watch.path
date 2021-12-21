@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync replica send watch
+
+[Path]
+PathChanged=/run/sync-replica.event
+
+[Install]
+WantedBy=multi-user.target

@@ -23,7 +23,7 @@ server {
 server {
     listen virbr.alias:80;
 
-    server_name sync-api.{{ sync_int_dom }} sync-api.virbr.{{ sync_int_dom }};
+    server_name sync-api.virbr.{{ sync_int_dom }};
 
     root /var/www/sync;
 

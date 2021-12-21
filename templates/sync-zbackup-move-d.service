@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync zbackup move daemon
+
+[Service]
+Type=simple
+User=www-admin
+ExecStart=/var/www/sync/zbackup-move-d.sh run
+ExecStop=/var/www/sync/zbackup-move-d.sh stop
+TimeoutStopSec=300
+
+[Install]
+WantedBy=multi-user.target

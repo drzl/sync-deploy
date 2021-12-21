@@ -1,0 +1,13 @@
+[Unit]
+Description=Sync replica send watch
+
+[Service]
+Type=simple
+User=www-admin
+ExecStart=/var/www/sync/replica-outgoing-transfer.sh
+
+StartLimitInterval=10
+StartLimitBurst=300
+
+[Install]
+WantedBy=multi-user.target

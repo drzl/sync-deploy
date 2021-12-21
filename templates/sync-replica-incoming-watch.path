@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync replica incoming watch
+
+[Path]
+PathChanged=/opt/sync/replica-incoming/transfer.event
+
+[Install]
+WantedBy=multi-user.target

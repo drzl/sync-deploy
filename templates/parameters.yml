@@ -19,7 +19,7 @@ parameters:
     email: 'bp@pvision.ru'
     email_name: 'Бизнес Пак Онлайн'
     telepak_url: 'http://sync-reporter.{{ sync_int_dom }}:8087/open'
-    sync_api_url: 'http://sync-api.{{ sync_int_dom }}/api'
+    sync_api_url: 'http://sync-api.virbr.{{ sync_int_dom }}/api'
     bp_web_url: https://5.375.ru
     bp_android_url: https://play.google.com/store/apps/details?id=ru.pvision.bussinespack
     bpsetup_url: https://www.pvision.ru/download/bp/700/sync/latest/bpsetup-sync.exe

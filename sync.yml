@@ -1,11 +1,10 @@
-#TODO: timezones, resolvconf
-
 - hosts: sync
 
   vars:
     ansible_ssh_user: "{{ sync_admin_user }}"
     ansible_ssh_pass: "{{ sync_admin_pass }}"
     ansible_become_password: "{{ sync_root_pass }}"
+    ansible_host_key_checking: false
 
   tasks:
     - name: Set ssh key
@@ -23,6 +22,18 @@
     sync_pub_dom_sync: "sync.{{ sync_pub_dom }}"
     sync_pub_dom_sync_f: "sync-f.{{ sync_pub_dom }}"
 
+    sync_hd_list: "{{
+      [
+        {
+          'name': 'fast',
+          'dev': sync_hd_fast | default('')
+        },
+        {
+          'name': 'big',
+          'dev': sync_hd_big | default('')
+        },
+      ] | selectattr('dev', '!=', '') }}"
+
   roles:
     - common
 
@@ -33,6 +44,55 @@
         name: "{{ sync_admin_user }}"
         groups: adm,sudo
         append: true
+
+    - name: Install parted
+      apt:
+        name: [parted, xfsprogs]
+        state: present
+        install_recommends: false
+      when: (sync_hd_list | length) > 0
+
+    - name: Create special partition
+      parted:
+        device: "/dev/{{ item.dev }}"
+        label: gpt
+        number: 1
+        state: present
+      loop: "{{ sync_hd_list }}"
+      register: part_create
+
+    - name: Create special filesystem
+      filesystem:
+        fstype: xfs
+        dev: "/dev/{{ item.dev | regex_replace('^(.*[0-9])$', '\\1p') }}1"
+        opts: -m rmapbt=1,reflink=1
+      loop: "{{ sync_hd_list }}"
+
+    - name: Update devices info
+      setup:
+        filter: ansible_devices
+      when: ((sync_hd_list | length) > 0) and part_create.changed
+
+    - name: Create special mount dir
+      file:
+        path: "/mnt/{{ item.name }}/vol0"
+        state: directory
+      loop: "{{ sync_hd_list }}"
+
+    - name: Mount special dir
+      mount:
+        path: "/mnt/{{ item.name }}/vol0"
+        src: "UUID={{ ansible_devices[item.dev]['partitions'][(item.dev | regex_replace('^(.*[0-9])$', '\\1p')) + '1']['uuid'] }}"
+        fstype: xfs
+        opts: defaults
+        state: mounted
+      loop: "{{ sync_hd_list }}"
+
+    - name: Create special sync dir
+      file:
+        path: "/mnt/{{ item.name }}/vol0/sync"
+        state: directory
+      loop: "{{ sync_hd_list }}"
 
     - name: Install system packages
       apt:
@@ -73,6 +133,12 @@
         state: restarted
       when: dnsmasq_conf.changed
 
+    - name: Remove resolveconf package
+      apt:
+        name: resolvconf
+        state: absent
+        install_recommends: false
+
     - name: Config resolv.conf
       copy:
         dest: "/etc/resolv.conf"
@@ -90,6 +156,19 @@
         sysctl_set: yes
         state: present
         reload: yes
+
+    - name: Create run0 shared mount dir
+      file:
+        path: /mnt/shared/run0
+        state: directory
+
+    - name: Mount run0 shared dir
+      mount:
+        path: /mnt/shared/run0
+        src: tmpfs
+        fstype: tmpfs
+        opts: "nofail,rw,noexec,nodev,nosuid,size=32M"
+        state: mounted
 
     - name: Create LXC export dir
       file:
@@ -170,12 +249,13 @@
         name: lxc-monitor-watch
         enabled: true
         state: started
+      register: lxc_monitor_watch_start
 
     - name: Retart LXC monitor watch service
       service:
         name: lxc-monitor-watch
         state: restarted
-      when: lxc_monitor_watch_script.changed
+      when: lxc_monitor_watch_script.changed and (not lxc_monitor_watch_start.changed)
 
     - name: Setup container bridge interface
       copy:
@@ -262,7 +342,7 @@
         container_log: true
         template: debian-pv
         state: started
-        template_options: --release=bullseye --packages=sudo,python3-minimal,python3-apt,libpython3-stdlib --auth-key=/opt/trans.pub
+        template_options: --release="{{ item.release }}" --packages=sudo,python3-minimal,python3-apt,libpython3-stdlib --auth-key=/opt/trans.pub
         container_config:
           - "lxc.net.0.ipv4.gateway = 192.168.{{ sync_net_ip_base }}.1"
           - "lxc.net.0.ipv4.address = 192.168.{{ sync_net_ip_base }}.{{ item.ip }}/24"
@@ -270,21 +350,31 @@
           - "lxc.hook.mount = /usr/local/bin/lxc-hooks.sh"
           - "lxc.hook.start-host = /usr/local/bin/lxc-hooks.sh"
           - "lxc.hook.post-stop = /usr/local/bin/lxc-hooks.sh"
+          - "lxc.mount.entry = /mnt/shared/run0 mnt/shared/run none bind,create=dir 0 0"
+          - "{{ '# ' if not item.use_fast }}lxc.mount.entry = /mnt/fast/vol0/{{ item.name }} mnt/fast none bind,create=dir 0 0"
+          - "{{ '# ' if not item.use_big }}lxc.mount.entry = /mnt/big/vol0/{{ item.name }} mnt/big none bind,create=dir 0 0"
       loop:
         - name: sync
           ip: 10
+          release: bullseye
+          use_fast: "{{ sync_hd_fast is defined }}"
+          use_big: "{{ sync_hd_big is defined }}"
         - name: sync-f
           ip: 11
+          release: buster
+          use_fast: false
+          use_big: false
 
     - name: Add sync to container inventory
       add_host:
         name: "sync.{{ hostvars[item].sync_int_dom }}"
         group: container_sync
 
+        sync_use_fast:  "{{ hostvars[item].sync_hd_fast is defined }}"
+        sync_use_big:  "{{ hostvars[item].sync_hd_big is defined }}"
+
         sync_int_dom: "{{ hostvars[item].sync_int_dom }}"
         sync_net_ip_base: "{{ hostvars[item].sync_net_ip_base }}"
-
-        sync_api_dom_f: "sync-f-api.{{ hostvars[item].sync_int_dom }}"
 
         sync_pub_dom_sync: "sync.{{ hostvars[item].sync_pub_dom }}"
         sync_pub_dom_sync_f: "sync-f.{{ hostvars[item].sync_pub_dom }}"
@@ -298,6 +388,8 @@
 
       loop: "{{ groups['sync'] }}"
       changed_when: false #!?
+      tags:
+        - fast
 
     - name: Add sync-f to container inventory
       add_host:
@@ -306,8 +398,6 @@
 
         sync_int_dom: "{{ hostvars[item].sync_int_dom }}"
         sync_net_ip_base: "{{ hostvars[item].sync_net_ip_base }}"
-
-        sync_api_dom_f: "sync-f-api.{{ hostvars[item].sync_int_dom }}"
 
         sync_pub_dom_sync: "sync.{{ hostvars[item].sync_pub_dom }}"
         sync_pub_dom_sync_f: "sync-f.{{ hostvars[item].sync_pub_dom }}"
@@ -398,32 +488,44 @@
       file:
         dest: /etc/nginx/sites-enabled/default
         state: absent
+      notify:
+        - Restart nginx
 
     - name: Dummy ssl dir
       file:
         path: /etc/nginx/ssl/0term
         state: directory
+      notify:
+        - Restart nginx
 
     - name: Dummy ssl cert
       copy:
         src: "./templates/0term.crt"
         dest: /etc/nginx/ssl/0term/0term.crt
+      notify:
+        - Restart nginx
 
     - name: Dummy ssl key
       copy:
         src: "./templates/0term.key"
         dest: /etc/nginx/ssl/0term/0term.key
+      notify:
+        - Restart nginx
 
     - name: Dummy ssl config
       template:
         src: "./templates/0term"
         dest: /etc/nginx/sites-available/0term
+      notify:
+        - Restart nginx
 
     - name: Dummy ssl config link
       file:
         src: /etc/nginx/sites-available/0term
         dest: /etc/nginx/sites-enabled/0term
         state: link
+      notify:
+        - Restart nginx
 
     - name: Lets encrypt ssl dir
       file:
@@ -434,12 +536,16 @@
       template:
         src: "./templates/sync"
         dest: /etc/nginx/sites-available/sync
+      notify:
+        - Restart nginx
 
     - name: sync config link
       file:
         src: /etc/nginx/sites-available/sync
         dest: /etc/nginx/sites-enabled/sync
         state: link
+      notify:
+        - Restart nginx
 
     - name: Config Nginx log format
       copy:
@@ -451,22 +557,35 @@
               '"$request" $status $body_bytes_sent '
               '"$http_referer" "$http_user_agent" '
               '$request_time $upstream_response_time';
+      notify:
+        - Restart nginx
 
     - name: sync-f config
       template:
         src: "./templates/sync-f"
         dest: /etc/nginx/sites-available/sync-f
+      notify:
+        - Restart nginx
 
     - name: sync-f config link
       file:
         src: /etc/nginx/sites-available/sync-f
         dest: /etc/nginx/sites-enabled/sync-f
         state: link
+      notify:
+        - Restart nginx
+
+  handlers:
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: reloaded
 
 - hosts: container_sync
 
   vars:
     ansible_ssh_user: root
+    ansible_host_key_checking: false
 
   pre_tasks:
 
@@ -515,6 +634,20 @@
         name: [firebird3.0-server]
         state: present
         install_recommends: false
+
+    - name: Config Firebird SQL UDF access
+      lineinfile:
+        path: /etc/firebird/3.0/firebird.conf
+        regexp: '^\s*UdfAccess'
+        line: 'UdfAccess = Restrict UDF'
+      register: fb_config_udf
+
+    - name: Config Firebird SQL bind address
+      lineinfile:
+        path: /etc/firebird/3.0/firebird.conf
+        regexp: '^\s*RemoteBindAddress'
+        line: 'RemoteBindAddress = 0.0.0.0'
+      register: fb_config_bind
 
     - name: Config Firebird SQL admin user A
       lineinfile:
@@ -608,7 +741,7 @@
       service:
         name: firebird3.0
         state: restarted
-      when: fb_config_system_user.changed
+      when: fb_config_system_user.changed or fb_config_udf.changed or fb_config_bind.changed
 
     - name: Creates sync app directory
       file:
@@ -621,27 +754,85 @@
     - name: Creates sync directories
       file:
         path: "{{ item.name }}"
-        state: directory
         owner: "{{ item.owner }}"
         group: pws-sync
         mode: u=rwx,g=rwxs,o=rx
+        state: directory
       loop:
-        - name: "/opt/sync"
+        - name: /opt/sync
           owner: www-admin
-        - name: "/opt/sync/backup"
+        - name: /opt/sync/bin
+          owner: www-admin
+        - name: /opt/sync/etc
+          owner: www-admin
+        - name: /opt/sync/log
+          owner: www-admin
+        - name: /opt/sync/db-replica
           owner: firebird
-        - name: "/opt/sync/bin"
+        - name: /opt/sync/replica-incoming
           owner: www-admin
-        - name: "/opt/sync/db"
-          owner: firebird
-        - name: "/opt/sync/db/template"
-          owner: firebird
-        - name: "/opt/sync/etc"
+        - name: /opt/sync/replica-outgoing
           owner: www-admin
-        - name: "/opt/sync/log"
+        - name: /var/tmp/pws_sync
           owner: www-admin
-        - name: "/var/tmp/pws_sync"
-          owner: www-admin
+
+    - name: Create sync db directory
+      file:
+        path: /opt/sync/db
+        owner: firebird
+        group: pws-sync
+        mode: u=rwx,g=rwxs,o=rx
+        state: directory
+      when: not sync_use_fast
+
+    - name: Create sync backup directory
+      file:
+        path: /opt/sync/backup
+        owner: firebird
+        group: pws-sync
+        mode: u=rwx,g=rwxs,o=rx
+        state: directory
+      when: not sync_use_big
+
+    - name: Create fast sync db directory
+      file:
+        path: /mnt/fast/db
+        owner: firebird
+        group: pws-sync
+        mode: u=rwx,g=rwxs,o=rx
+        state: directory
+      when: sync_use_fast
+
+    - name: Create fast sync db link
+      file:
+        src: /mnt/fast/db
+        dest: /opt/sync/db
+        state: link
+      when: sync_use_fast
+
+    - name: Create big sync backup directory
+      file:
+        path: /mnt/big/backup
+        owner: firebird
+        group: pws-sync
+        mode: u=rwx,g=rwxs,o=rx
+        state: directory
+      when: sync_use_big
+
+    - name: Create big sync backup link
+      file:
+        src: /mnt/big/backup
+        dest: /opt/sync/backup
+        state: link
+      when: sync_use_big
+
+    - name: Create sync db/template directory
+      file:
+        path: /opt/sync/db/template
+        owner: firebird
+        group: pws-sync
+        mode: u=rwx,g=rwxs,o=rx
+        state: directory
 
     - name: Configure message session daemon
       template:
@@ -695,6 +886,7 @@
     - name: Clone sync app
       become: yes
       become_user: www-admin
+      become_method: su
       hg:
         repo: "http://vedmed:{{ sync_hg_pass }}@vc.pvision.lo-forward/pws"
         dest: /var/www/sync
@@ -704,12 +896,168 @@
         src: "./templates/config_pws_sync.php"
         dest: "/var/www/sync/config_pws_sync.php"
         owner: www-admin
-        mode: 644
+        group: www-data
+        mode: "0644"
+      tags:
+        - fast
+
+    - name: Create /opt/etc
+      file:
+        path: /opt/etc
+        state: directory
+
+    - name: Create /opt/bin
+      file:
+        path: /opt/bin
+        state: directory
+
+    ###
+
+    - name: Copy notify-exec daemon binary
+      copy:
+        src: "./bin/notify-exec-d"
+        dest: "/opt/bin/notify-exec-d"
+        owner: root
+        mode: "0755"
+
+    - name: Config notify-exec daemon
+      copy:
+        dest: "/opt/etc/notify-exec.toml"
+        owner: www-admin
+        group: pws-sync
+        mode: "0644"
+        content: |
+          unixsocket = "/mnt/shared/run/notify-exec.socket"
+          exec = "/usr/bin/php"
+          execargs = ["/var/www/sync/sync-replica-send-cmd.php"]
+      register: notify_exec_config
+
+    - name: Install notify-exec daemon
+      template:
+        src: "./templates/notify-exec-d.service"
+        dest: "/etc/systemd/system/notify-exec-d.service"
+        owner: root
+        mode: "0644"
+
+    - name: Start notify-exec service
+      systemd:
+        name: notify-exec-d
+        enabled: true
+        state: started
+      register: notify_exec_start
+
+    - name: Retart notify-exec service
+      service:
+        name: notify-exec-d
+        state: restarted
+      when: notify_exec_config.changed and (not notify_exec_start.changed)
+
+    ### sync replica incoming watch
+
+    - name: Config sync replica incoming watch daemon
+      copy:
+        dest: "/var/www/sync/replica-incoming-apply-config.inc"
+        owner: www-admin
+        group: pws-sync
+        mode: "0644"
+        content: |
+          REPLICA_INCOMING_DIR=/opt/sync/replica-incoming
+
+    - name: Install sync replica incoming watch daemon
+      template:
+        src: "./templates/sync-replica-incoming-watch.service"
+        dest: "/etc/systemd/system/sync-replica-incoming-watch.service"
+        owner: root
+        mode: "0644"
+
+    - name: Start sync replica incoming watch daemon
+      systemd:
+        name: sync-replica-incoming-watch.service
+        enabled: true
+        #state: started
+
+    #
+
+    - name: Install sync replica incoming watch path
+      template:
+        src: "./templates/sync-replica-incoming-watch.path"
+        dest: "/etc/systemd/system/sync-replica-incoming-watch.path"
+        owner: root
+        mode: "0644"
+
+    - name: Start sync replica incoming watch path
+      systemd:
+        name: sync-replica-incoming-watch.path
+        enabled: true
+        state: started
+
+    ### sync replica incoming messages watch
+
+    - name: Install sync replica incoming messages watch daemon
+      template:
+        src: "./templates/sync-replica-incoming-watch-messages.service"
+        dest: "/etc/systemd/system/sync-replica-incoming-watch-messages.service"
+        owner: root
+        mode: "0644"
+
+    - name: Start sync replica incoming messages watch daemon
+      systemd:
+        name: sync-replica-incoming-watch-messages.service
+        enabled: true
+        #state: started
+
+    #
+
+    - name: Install sync replica incoming messages watch path
+      template:
+        src: "./templates/sync-replica-incoming-watch-messages.path"
+        dest: "/etc/systemd/system/sync-replica-incoming-watch-messages.path"
+        owner: root
+        mode: "0644"
+
+    - name: Start sync replica incoming messages watch path
+      systemd:
+        name: sync-replica-incoming-watch-messages.path
+        enabled: true
+        state: started
+
+    ### sync replica send watch
+
+    - name: Install sync replica send watch daemon
+      template:
+        src: "./templates/sync-replica-send-watch.service"
+        dest: "/etc/systemd/system/sync-replica-send-watch.service"
+        owner: root
+        mode: "0644"
+
+    - name: Stop sync replica send watch daemon
+      systemd:
+        name: sync-replica-send-watch.service
+        enabled: false
+        state: stopped
+
+    #
+
+    - name: Install sync replica send watch path
+      template:
+        src: "./templates/sync-replica-send-watch.path"
+        dest: "/etc/systemd/system/sync-replica-send-watch.path"
+        owner: root
+        mode: "0644"
+
+    - name: Stop sync replica send watch path
+      systemd:
+        name: sync-replica-send-watch.path
+        enabled: false
+        state: stopped
+
+########################################################################################
 
 - hosts: container_sync_f
 
   vars:
     ansible_ssh_user: root
+    ansible_host_key_checking: false
     sync_f_app_dir: "/var/www/bpsync_447"
 
   pre_tasks:
@@ -792,16 +1140,25 @@
     - name: Clone sync-f app
       become: yes
       become_user: www-admin
+      become_method: su
       git:
         repo: "ssh://git@gitorious.pvision.lo-forward:50022/bp/bpws.git"
         version: prod2
         dest: "{{ sync_f_app_dir }}"
         accept_hostkey: true
 
+    - name: Create sync-f work dirs
+      file:
+        path: "{{ sync_f_app_dir }}/var"
+        owner: www-admin
+        group: www-data
+        mode: 0770
+        state: directory
+
     - name: Config sync-f app
       template:
         src: "./templates/parameters.yml"
-        dest: "/var/www/bpsync_447/config/packages/parameters.yaml"
+        dest: "{{ sync_f_app_dir }}/config/packages/parameters.yaml"
         owner: www-admin
         group: www-data
         mode: "0644"

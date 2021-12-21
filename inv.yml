@@ -10,3 +10,5 @@ sync:
       sync_int_dom: d11b.pvision
       sync_pub_dom: d11b.gen3.pvision.ru
       sync_net_ip_base: 162
+      sync_hd_fast: nvme0n1
+      sync_hd_big: vdb

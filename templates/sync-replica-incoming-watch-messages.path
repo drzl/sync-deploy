@@ -1,0 +1,8 @@
+[Unit]
+Description=Sync replica incoming watch messages
+
+[Path]
+PathChanged=/opt/sync/replica-incoming/transfer-messages.event
+
+[Install]
+WantedBy=multi-user.target
